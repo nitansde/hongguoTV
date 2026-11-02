@@ -31,7 +31,9 @@ internal class TvSearchPanel(
             isSingleLine = true
             filters = arrayOf(InputFilter.LengthFilter(80))
             showSoftInputOnFocus = false
-            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+            imeOptions =
+                android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH or
+                    android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
             setText(initial)
             setSelection(text.length)
             background = TvStyle.card(context, false)
@@ -69,6 +71,13 @@ internal class TvSearchPanel(
             setOnFocusChangeListener { _, focused -> background = TvStyle.card(context, focused) }
             setOnClickListener(click)
         }
+
+    private fun showKeyboard() {
+        input.showSoftInputOnFocus = true
+        input.requestFocus()
+        (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+            .showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+    }
 
     private fun hideKeyboard() {
         input.showSoftInputOnFocus = false
@@ -147,12 +156,7 @@ internal class TvSearchPanel(
                 action("删除") { delete() },
                 action("清空") { input.setText("") },
                 searchButton,
-                action("中文输入") {
-                    input.showSoftInputOnFocus = true
-                    input.requestFocus()
-                    (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
-                        .showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
-                },
+                action("中文输入") { showKeyboard() },
                 action("手机输入") {
                     hideKeyboard()
                     phone(it)
@@ -215,10 +219,7 @@ internal class TvSearchPanel(
         addView(resultColumn, LayoutParams(0, -1, 1f))
         input.nextFocusUpId = upper.id
         input.nextFocusDownId = keys.first().id
-        input.setOnEditorActionListener { _, _, _ ->
-            submit()
-            true
-        }
+        input.onSearchAction(::showKeyboard) { submit() }
         suggestions.navigationChanged = { updateNavigation() }
         updateNavigation()
     }

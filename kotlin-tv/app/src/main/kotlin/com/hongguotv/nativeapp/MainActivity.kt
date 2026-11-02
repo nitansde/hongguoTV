@@ -287,6 +287,36 @@ class MainActivity : Activity() {
                 main.postDelayed(this, 1000)
             }
         }
+    private lateinit var appliedConfig: android.content.res.Configuration
+    private var okDown = false
+    private var speedBadge: TextView? = null
+    private val holdSpeed = Runnable {
+        if (player?.isPlaying == true) {
+            player?.setPlaybackSpeed(2f)
+            speedBadge =
+                text("2× 快进中", 16f).apply {
+                    setPadding(dp(14), dp(7), dp(14), dp(7))
+                    background = rounded(Color.argb(190, 0, 0, 0))
+                }
+            root.addView(
+                speedBadge,
+                FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
+                    topMargin = dp(24)
+                },
+            )
+        }
+    }
+
+    private fun releaseHold(): Boolean {
+        main.removeCallbacks(holdSpeed)
+        okDown = false
+        val held = speedBadge ?: return false
+        root.removeView(held)
+        speedBadge = null
+        player?.setPlaybackSpeed(library.playbackSpeed)
+        return true
+    }
+
     private val hideHud = Runnable {
         if (screen == "player" && !panel && player?.isPlaying == true && !playError)
             hidePlaybackOverlay()
@@ -372,6 +402,7 @@ class MainActivity : Activity() {
     // 启动入口：创建根容器，初始化账户、更新和媒体控制，再异步读取本机记录。
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
+        appliedConfig = android.content.res.Configuration(resources.configuration)
         window.decorView.systemUiVisibility =
             View.SYSTEM_UI_FLAG_FULLSCREEN or
                 View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
@@ -638,7 +669,8 @@ class MainActivity : Activity() {
             else if (problem is java.net.SocketTimeoutException) "连接超时"
             else problem.message.orEmpty().replace(Regex("https?://\\S+"), "[地址]").take(160)
         parent.addView(text(detail, 13f, muted))
-        addButton(parent, "重试", onClick = retry).requestFocus()
+        val retryButton = addButton(parent, "重试", onClick = retry)
+        if (searchInput?.hasFocus() != true) retryButton.requestFocus()
     }
 
     // 导航按钮的点击入口：记录当前栏目状态，再切换到目标栏目。
@@ -981,7 +1013,10 @@ class MainActivity : Activity() {
                         isSingleLine = true
                         maxLines = 1
                         filters = arrayOf(android.text.InputFilter.LengthFilter(80))
-                        imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+                        imeOptions =
+                            android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH or
+                                android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                        setSelection(length())
                     }
                 searchRow.addView(
                     input,
@@ -1027,10 +1062,11 @@ class MainActivity : Activity() {
                             .apply { nextFocusUpId = input.nextFocusUpId }
 
                 nav.forEach { it.nextFocusDownId = input.id }
-                input.setOnEditorActionListener { _, _, _ ->
-                    search()
-                    true
-                }
+                input.onSearchAction({
+                    input.requestFocus()
+                    (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+                        .showSoftInput(input, 0)
+                }) { search() }
                 container.addView(searchRow)
                 searchSuggestions =
                     SearchSuggestionsView(
@@ -1410,7 +1446,8 @@ class MainActivity : Activity() {
                 typeButtons.values.forEach { it.nextFocusDownId = resumeCards.first().id }
                 resumeCards.forEach { it.nextFocusDownId = it.id }
             }
-            if (focusType) typeButtons[library.contentType]?.requestFocus()
+            if (searchInput?.hasFocus() == true) Unit // 移动焦点会丢失正在组字的拼音
+            else if (focusType) typeButtons[library.contentType]?.requestFocus()
             else if (collectionBack != null && !focusNav) collectionBack?.requestFocus()
             else if (sourceButtons.isNotEmpty() && !focusNav)
                 sourceButtons[if (isAccountHistory() || isAccountFavorites()) 1 else 0]
@@ -1694,7 +1731,8 @@ class MainActivity : Activity() {
         searchInput?.nextFocusDownId = cards.first().id
         searchButton?.nextFocusDownId = cards[minOf(4, cards.lastIndex)].id
         searchActions.forEach { it.nextFocusDownId = cards[minOf(4, cards.lastIndex)].id }
-        if (focusType) typeButtons[library.contentType]?.requestFocus()
+        if (searchInput?.hasFocus() == true) Unit // 移动焦点会丢失正在组字的拼音
+        else if (focusType) typeButtons[library.contentType]?.requestFocus()
         else if (focusNav) nav[tab].requestFocus()
         else if (
             resumeCards.isNotEmpty() &&
@@ -1824,7 +1862,8 @@ class MainActivity : Activity() {
             browser.setSideEntry(panel.middleEntry() ?: panel.entry())
             nav.forEach { it.nextFocusDownId = panel.entry().id }
         }
-        if (focusNav) nav[tab].requestFocus()
+        if (searchInput?.hasFocus() == true) Unit // 移动焦点会丢失正在组字的拼音
+        else if (focusNav) nav[tab].requestFocus()
         else if (focusType) upper.requestFocus() else browser.enter()
     }
 
@@ -3974,6 +4013,7 @@ class MainActivity : Activity() {
     }
 
     private fun releasePlayer(keepPrepared: Boolean = false) {
+        releaseHold()
         social.reset()
         cancelRecovery()
         cancelPrefetchState(keepPrepared)
@@ -4101,14 +4141,25 @@ class MainActivity : Activity() {
                     }
                 return true
             }
+            val ok = key == KeyEvent.KEYCODE_DPAD_CENTER || key == KeyEvent.KEYCODE_ENTER
+            // 进入播放页那次按键的抬起不算确认，否则新剧集一开始就会暂停。
+            if (ok && event.action == KeyEvent.ACTION_UP && (okDown || speedBadge != null)) {
+                if (!releaseHold() && !panel) togglePlayback()
+                return true
+            }
             if (!panel) {
+                if (ok) {
+                    if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                        okDown = true
+                        main.postDelayed(holdSpeed, 500)
+                    }
+                    return true
+                }
                 if (
                     key in
                         listOf(
                             KeyEvent.KEYCODE_DPAD_LEFT,
                             KeyEvent.KEYCODE_DPAD_RIGHT,
-                            KeyEvent.KEYCODE_DPAD_CENTER,
-                            KeyEvent.KEYCODE_ENTER,
                             KeyEvent.KEYCODE_DPAD_UP,
                             KeyEvent.KEYCODE_DPAD_DOWN,
                             KeyEvent.KEYCODE_MENU,
@@ -4118,8 +4169,6 @@ class MainActivity : Activity() {
                         when (key) {
                             KeyEvent.KEYCODE_DPAD_LEFT -> seek(-1, event.repeatCount)
                             KeyEvent.KEYCODE_DPAD_RIGHT -> seek(1, event.repeatCount)
-                            KeyEvent.KEYCODE_DPAD_CENTER,
-                            KeyEvent.KEYCODE_ENTER -> if (event.repeatCount == 0) togglePlayback()
                             KeyEvent.KEYCODE_DPAD_DOWN ->
                                 if (event.repeatCount == 0) showEpisodePanel(hud)
                             KeyEvent.KEYCODE_DPAD_UP,
@@ -4135,6 +4184,14 @@ class MainActivity : Activity() {
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        val changed = appliedConfig.diff(newConfig)
+        appliedConfig = android.content.res.Configuration(newConfig)
+        // 键盘或遥控器连接、休眠不影响画面；重建会销毁输入框和正在组字的内容，并打断播放。
+        val inputOnly =
+            android.content.pm.ActivityInfo.CONFIG_KEYBOARD or
+                android.content.pm.ActivityInfo.CONFIG_KEYBOARD_HIDDEN or
+                android.content.pm.ActivityInfo.CONFIG_NAVIGATION
+        if (changed and inputOnly.inv() == 0) return
         if (!library.isLoaded) return
         when (screen) {
             "player" -> {
@@ -4205,6 +4262,7 @@ class MainActivity : Activity() {
         searchSuggestions?.cancel()
         social.foreground(false)
         updater.pause()
+        releaseHold()
         homeFeed?.pause()
         foreground = false
         main.removeCallbacks(tick)
