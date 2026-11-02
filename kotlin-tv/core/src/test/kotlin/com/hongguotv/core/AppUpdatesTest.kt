@@ -95,7 +95,7 @@ class AppUpdatesTest {
     @Test
     fun downloadUrlUsesOnlyFixedRepositoryAndValidatedNames() {
         assertEquals(
-            "https://gitcode.com/tsukiyo-zero/hongguoTV/releases/download/kotlin-v0.9.0-build.1/hongguotv-kotlin-0.9.0-build.1-android8.apk",
+            "https://github.com/nitansde/hongguoTV2/releases/download/kotlin-v0.9.0-build.1/hongguotv-kotlin-0.9.0-build.1-android8.apk",
             update().downloadUrl,
         )
         for (value in

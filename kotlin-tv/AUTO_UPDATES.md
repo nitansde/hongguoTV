@@ -1,6 +1,8 @@
 # 应用内更新与发布
 
-更新源为 GitCode 本仓库公开 Releases：`tsukiyo-zero/hongguoTV`。
+本 fork 的更新源为 GitHub Releases：`nitansde/hongguoTV2`。推送 `release-*` 标签即触发 `.github/workflows/tv-release.yml`，测试、签名后发布 APK、源码、`update.json` 和 `SHA256SUMS`。versionCode 为 1000 + 运行次数，版本号改 workflow 里的 `APP_VERSION`。所有版本必须用同一把密钥签名，`scripts/publish-github-release.py` 固定校验其证书指纹。密钥存放在仓库 Secrets，绝不提交到仓库。
+
+以下内容为上游（GitCode）的发布说明，本 fork 不使用。
 
 电视先请求 `https://api.gitcode.com/api/v5/repos/tsukiyo-zero/hongguoTV/releases/latest?type=latest`，获取最新正式发行版标签，再读取该标签附件中的 `update.json`，比较内部版本号，并从 GitCode 根据清单的标签和附件名下载 APK。清单标签必须与接口返回标签一致。仅允许 HTTPS 和 GitCode 官方 API、站点及 file-cdn.gitcode.com 下载域名。此流程由 App 实现；最终覆盖安装由安卓系统执行。
 

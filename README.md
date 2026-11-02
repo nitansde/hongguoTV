@@ -1,5 +1,7 @@
 # 果映 TV · hongguoTV
 
+> **关于这个 fork**：基于 [tsukiyo-zero/hongguoTV](https://github.com/tsukiyo-zero/hongguoTV)，修复电视中文输入并支持长按确认键 2 倍速。[下载最新版](https://github.com/nitansde/hongguoTV2/releases/latest)。应用内更新读取本仓库的 GitHub Releases；因签名不同，首次安装需先卸载其他版本。推送 `release-*` 标签即自动发布，见 [发布说明](kotlin-tv/AUTO_UPDATES.md)。以下为上游说明，其中的下载和更新信息指向上游。
+
 非官方红果短剧客户端，主要维护 Android TV 版，同时提供原生 Mac 客户端 hongguoMac。
 
 Android TV 使用 `kotlin-tv/` 中的 Kotlin 原生客户端，支持 **Android 6.0 及以上**。安装一个 APK 即可使用，无需部署 Node 或 Docker。Mac 客户端独立构建、独立更新。

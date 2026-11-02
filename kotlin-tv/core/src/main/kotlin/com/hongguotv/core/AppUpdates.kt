@@ -29,10 +29,9 @@ data class AppUpdate(
         get() = "$RELEASES/download/$tag/$fileName"
 
     companion object {
-        const val REPOSITORY = "tsukiyo-zero/hongguoTV"
-        const val RELEASES = "https://gitcode.com/$REPOSITORY/releases"
-        const val LATEST_API =
-            "https://api.gitcode.com/api/v5/repos/$REPOSITORY/releases/latest?type=latest"
+        const val REPOSITORY = "nitansde/hongguoTV2"
+        const val RELEASES = "https://github.com/$REPOSITORY/releases"
+        const val LATEST_API = "https://api.github.com/repos/$REPOSITORY/releases/latest"
 
         fun latestTag(json: String): String {
             val release = JSONObject(json)
@@ -146,11 +145,17 @@ class AppUpdateRepository : java.io.Closeable {
             .callTimeout(5, TimeUnit.MINUTES)
             .addNetworkInterceptor { chain ->
                 val url = chain.request().url
-                // Follow GitCode's CDN redirects, never cleartext or arbitrary manifest-provided
+                // Follow GitHub's CDN redirects, never cleartext or arbitrary manifest-provided
                 // hosts.
                 if (
                     url.scheme != "https" ||
-                        url.host !in setOf("api.gitcode.com", "gitcode.com", "file-cdn.gitcode.com")
+                        url.host !in
+                            setOf(
+                                "api.github.com",
+                                "github.com",
+                                "release-assets.githubusercontent.com",
+                                "objects.githubusercontent.com",
+                            )
                 )
                     throw IOException("更新下载地址不受支持")
                 chain.proceed(chain.request())
