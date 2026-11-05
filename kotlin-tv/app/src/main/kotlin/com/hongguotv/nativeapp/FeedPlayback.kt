@@ -22,6 +22,8 @@ internal data class TrialClip(
     val video: RemoteVideo,
     val episodeCount: Int = detail.episodes.size,
     val track: VideoTracks.Track? = null,
+    // 实际试播集的集内序号（1 起）：bytevc2 锁定集后移换集后 >1，界面据此改文案。
+    val trialEpisodeIndex: Int = 1,
 ) : Closeable {
     val episodeId
         get() = detail.episodes.first()
@@ -50,6 +52,13 @@ internal interface FeedBackend : Closeable {
     fun trial(series: Series): TrialClip = prepare(detail(series))
 
     fun preload(series: Series): TrialClip = prefetch(detail(series))
+
+    /** 首页展示过一部作品时通知后端，供下次冷启动跳过重复内容。 */
+    fun noteDisplayed(
+        series: Series,
+        cursor: RecommendationCursor,
+        category: DramaCategory? = null,
+    ) = Unit
 }
 
 internal class PublicFeedBackend(
@@ -109,19 +118,33 @@ internal class PublicFeedBackend(
         cursor: RecommendationCursor,
         fetch: () -> CatalogPage,
     ): CatalogPage {
-        if (page == 1)
-            startupCache?.load(cacheIdentity, source)?.let { cached ->
-                if (cursor.restoreStarter(cached)) {
-                    synchronized(trialHints) { startupPages[source] = cached }
-                    android.util.Log.i("HongguoTV", "Home starter-cache hit")
-                    return rememberHints(cached)
+        if (page == 1) {
+            // 冷启动先接上次的分页游标：服务端在没有 session_id 时永远返回同一批冷启动内容，
+            // 只有把会话和 offset 带过去才能「下次进来接着刷」。
+            if (!cursor.hasProgress) {
+                startupCache?.loadCursor(cacheIdentity, source)?.let { saved ->
+                    val ok = cursor.restore(saved)
+                    android.util.Log.i("HongguoTV", "Home cursor-restore ok=$ok snapshotChars=${saved.length}")
                 }
             }
+            val resumed = cursor.hasProgress
+            android.util.Log.i("HongguoTV", "Home cursor resumed=$resumed")
+            if (!resumed)
+                startupCache?.load(cacheIdentity, source)?.let { cached ->
+                    if (cursor.restoreStarter(cached)) {
+                        synchronized(trialHints) { startupPages[source] = cached }
+                        android.util.Log.i("HongguoTV", "Home starter-cache hit")
+                        return rememberHints(cached)
+                    }
+                }
+        }
         val result = rememberHints(fetch())
         if (page == 1) {
             synchronized(trialHints) { startupPages[source] = result }
             startupCache?.save(cacheIdentity, source, result)
         }
+        startupCache?.saveCursor(cacheIdentity, source, cursor.snapshot())
+        android.util.Log.i("HongguoTV", "Home cursor-save bytes=${cursor.snapshot().length}")
         return result
     }
 
@@ -146,6 +169,18 @@ internal class PublicFeedBackend(
     override fun catalog(category: DramaCategory, page: Int) =
         repository.discover(category, page = page)
 
+    override fun noteDisplayed(
+        series: Series,
+        cursor: RecommendationCursor,
+        category: DramaCategory?,
+    ) {
+        if (closed.get()) return
+        cursor.markSeen(series.id)
+        // 同步落盘：这一条是「下次进来别再看到它」的唯一依据，异步写会和退出时的 close()
+        // 抢跑，导致快照丢失。快照受 64 KiB 与最近 540 条去重记录限制。
+        startupCache?.saveCursor(cacheIdentity, category?.route ?: "recommend", cursor.snapshot())
+    }
+
     override fun detail(series: Series) = timed("detail") { repository.detail(series.id) }
 
     private fun open(id: String): OpenedStream =
@@ -160,10 +195,38 @@ internal class PublicFeedBackend(
             it == null || CodecCapabilities.supports(it)
         } ?: throw java.io.IOException("该作品暂时没有可试播的剧集")
 
+    /** 试播集打开结果：流 + 实际集 id + 界面展示序号（1 起）。 */
+    private data class OpenedTrial(
+        val opened: OpenedStream,
+        val episodeId: String,
+        val displayIndex: Int,
+    )
+
+    // 第一集优先；bytevc2 锁定集（该集无电视可解码档）后移，最多探到第三集并回报实际序号。
+    // 全部不可解时给确定性文案，不再报「暂时没有可试播的剧集」。
+    private fun openTrialEpisode(series: Series, hint: TrialHint): OpenedTrial {
+        try {
+            return OpenedTrial(timed("play-address") { open(hint.episodeId) }, hint.episodeId, 1)
+        } catch (problem: NoPlayableQualityException) {
+            val full = detail(series)
+            val found =
+                firstPlayableEpisode(full.episodes, 1, ::open)
+                    ?: throw java.io.IOException("该剧暂无电视可解码的清晰度")
+            return OpenedTrial(found.first, full.episodes[found.second], found.second + 1)
+        }
+    }
+
     override fun prepare(detail: Detail): TrialClip {
-        val id = detail.episodes.firstOrNull() ?: throw java.io.IOException("该作品暂时没有可试播的剧集")
-        val opened = open(id)
-        return TrialClip(detail, opened.video, track = opened.track)
+        if (detail.episodes.isEmpty()) throw java.io.IOException("该作品暂时没有可试播的剧集")
+        val found =
+            firstPlayableEpisode(detail.episodes, 0, ::open)
+                ?: throw java.io.IOException("该剧暂无电视可解码的清晰度")
+        return TrialClip(
+            detail,
+            found.first.video,
+            track = found.first.track,
+            trialEpisodeIndex = found.second + 1,
+        )
     }
 
     override fun trial(series: Series): TrialClip {
@@ -193,12 +256,13 @@ internal class PublicFeedBackend(
                     }
                     verified
                 }
-        val opened = timed("play-address") { open(hint.episodeId) }
+        val openedTrial = openTrialEpisode(series, hint)
         return TrialClip(
-            Detail(series, listOf(hint.episodeId)),
-            opened.video,
+            Detail(series, listOf(openedTrial.episodeId)),
+            openedTrial.opened.video,
             hint.episodeCount,
-            opened.track,
+            openedTrial.opened.track,
+            openedTrial.displayIndex,
         )
     }
 
@@ -262,20 +326,23 @@ internal interface TrialPlayback {
         set(_) {}
 }
 
+/** 试播自愈的迭代上限：竖屏首播通常 1080P→720P→480P 两轮收敛，3 轮留出余量。 */
+internal const val TRIAL_SELF_HEAL_LIMIT = 3
+
 /**
- * 试播自愈判定：解码类失败 + 有可学习的轨道信息 + 该剧本次会话尚未自愈过。网络类错误与缺失
- * 轨道（无法定位学习键）不自愈。
+ * 试播自愈判定：解码类失败 + 有可学习的轨道信息 + 该剧本次会话自愈次数未达上限。网络类错误
+ * 与缺失轨道（无法定位学习键）不自愈。
  */
 internal fun shouldSelfHealTrial(
     errorCode: Int?,
     hasTrack: Boolean,
-    alreadyHealed: Boolean,
+    attempts: Int,
 ): Boolean =
     errorCode != null &&
         errorCode in PlaybackException.ERROR_CODE_DECODER_INIT_FAILED..
                 PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED &&
         hasTrack &&
-        !alreadyHealed
+        attempts < TRIAL_SELF_HEAL_LIMIT
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 internal class Media3TrialPlayback(context: Context) : TrialPlayback {

@@ -10,6 +10,7 @@ import java.util.concurrent.TimeUnit
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -161,6 +162,10 @@ class EmptyPlaybackResponseException(val detail: String? = null) :
 
 /** 连续整轮空响应达到该次数后轮换一次设备身份（两轮 = 8 发跨 3 域名全空，约 25 秒）。 */
 private const val IDENTITY_ROTATE_ROUNDS = 2
+
+/** 播放模型请求使用的厂商 UA；旧 `/novel/player` 与新 `video_tab` 接口一致。 */
+private const val PLAYER_UA =
+    "com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)"
 
 class ContentRepository
 @JvmOverloads
@@ -660,6 +665,68 @@ constructor(
         return Detail(card(o).copy(id = id), episodes)
     }
 
+    /**
+     * 官方 App 现行的播放模型接口：`GET /reading/bookapi/video_tab/multi_video_model/v1/`。
+     *
+     * 2026-11-02 实测：旧的 `POST /novel/player/multi_video_model/v1/` 在八个域名上对所有请求
+     * 返回 HTTP 200 + 0 字节（官方 UA、完整签名头、空 body、无 Cookie、h2/h1.1、Chrome 指纹
+     * 全部如此），而本接口同一时刻正常返回 `code 0` 与五档 `video_list`。官方 APK
+     * （classes5.dex 的 `RpcOperation`）仍保留这条路径，参数取自 `GetVideoModelRequest` 的
+     * `@SerializedName`（snake_case）；缺任一字段服务端回 `100103 PARAM_INVALID`。
+     *
+     * 失败（非 0 code、空正文、结构不符、网络异常）一律返回 null，由调用方回退旧接口，不改变
+     * 既有的空响应恢复与身份轮换语义。
+     */
+    private fun tabVideoModel(id: String, identity: PlaybackDeviceSession.Profile): JSONObject? {
+        val extra =
+            "&video_id=$id&video_id_type=0&device_level=1&need_all_video_definition=1" +
+                "&need_mp4_align=0&use_os_player=0&video_platform=1024&source=0&from_video_id="
+        // 只试一次：新接口失败时旧接口仍有三域名换路重试兜底，重复换路没有收益。
+        for (host in listOf(PlayRetryPlan.hosts.first())) {
+            val query = Signer.encode(identity.values + ("_rticket" to clock().toString()))
+            val request =
+                Request.Builder()
+                    .url("https://$host/reading/bookapi/video_tab/multi_video_model/v1/?$query$extra")
+                    .header("User-Agent", PLAYER_UA)
+                    .header("Accept", "application/json; charset=utf-8")
+                    .apply {
+                        if (identity.cookie.isNotBlank()) header("Cookie", identity.cookie)
+                    }
+                    .get()
+                    .build()
+            val text =
+                try {
+                    RequestScope.execute(http.newCall(request)) { response ->
+                        if (!response.isSuccessful) throw ContentHttpException(response.code)
+                        response.body?.string().orEmpty()
+                    }
+                } catch (problem: IOException) {
+                    if (Thread.currentThread().isInterrupted) throw problem
+                    continue
+                } catch (problem: RuntimeException) {
+                    continue
+                }
+            val root = runCatching { JSONObject(text) }.getOrNull() ?: continue
+            if (root.optInt("code", root.optInt("Code", -1)) != 0) continue
+            val data = root.optJSONObject("data") ?: continue
+            val rows = data.optJSONObject("video_model_data") ?: data
+            val row =
+                rows.optJSONObject(id)
+                    ?: rows.keys().asSequence().mapNotNull { rows.optJSONObject(it) }.firstOrNull()
+                    ?: continue
+            val raw = row.opt("video_model") ?: continue
+            val model =
+                (when (raw) {
+                    is JSONObject -> raw
+                    is String -> runCatching { JSONObject(raw) }.getOrNull()
+                    else -> null
+                }) ?: continue
+            if ((model.optJSONArray("video_list")?.length() ?: 0) == 0) continue
+            return JSONObject().put("video_model", model)
+        }
+        return null
+    }
+
     fun stream(
         id: String,
         maxQuality: Int = 1080,
@@ -689,6 +756,10 @@ constructor(
             cached
                 ?: run {
                     val ids = (listOf(id) + metadataAhead).distinct()
+                    // 官方 App 现行播放模型接口优先：2026-11-02 实测旧的 /novel/player 族在全部
+                    // 八个域名上对所有请求返回 200 + 0 字节，而这条 GET 接口同刻正常出五档。
+                    val identity = playbackSession.profile(http)
+                    tabVideoModel(id, identity)?.let { return@run it }
                     // device_level=1 是服务端最保守的编码供给：level=3 会把部分剧集的 360P-720P
                     // 档下发成 bytevc2（Android 提取器读不出视频轨，只能被过滤掉），该集便只剩
                     // 1080P 一档，竖屏超出电视解码上限后降无可降；level=1 对正常集供给与 3 一致。
@@ -711,7 +782,7 @@ constructor(
                         playbackSession.rotate(http)
                         synchronized(playbackIdentityLock) { emptyPlaybackRotated = true }
                     }
-                    val identity = playbackSession.profile(http)
+                    val requestIdentity = playbackSession.profile(http)
                     var content: String? = null
                     var lastError: IOException? = null
                     val tried = mutableListOf<String>()
@@ -727,7 +798,7 @@ constructor(
                         val host = PlayRetryPlan.host(attempt)
                         tried += PlayRetryPlan.tag(host)
                         val query =
-                            Signer.encode(identity.values + ("_rticket" to clock().toString()))
+                            Signer.encode(requestIdentity.values + ("_rticket" to clock().toString()))
                         val playerUrl = "https://$host/novel/player/multi_video_model/v1/?$query"
                         val request =
                             signedRequest(
@@ -735,13 +806,12 @@ constructor(
                                 Signer.Request(
                                     playerUrl,
                                     mapOf(
-                                        "User-Agent" to
-                                            "com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)",
+                                        "User-Agent" to PLAYER_UA,
                                         "Accept" to
                                             "application/json; charset=utf-8,application/x-protobuf",
                                     ) +
-                                        (if (identity.cookie.isBlank()) emptyMap()
-                                        else mapOf("Cookie" to identity.cookie)) +
+                                        (if (requestIdentity.cookie.isBlank()) emptyMap()
+                                        else mapOf("Cookie" to requestIdentity.cookie)) +
                                         (if (PlayRetryPlan.freshConnection(attempt))
                                             mapOf("Connection" to "close")
                                         else emptyMap()),
@@ -864,10 +934,25 @@ constructor(
                         .getOrDefault(raw.toString())
             }
         if (!fallback.startsWith("https://")) throw IOException("播放地址格式异常")
-        val info =
+        var info =
             JSONObject(text(fallback)).optJSONObject("video_info")?.optJSONObject("data")
                 ?: throw IOException("没有播放资源")
-        val videoList = info.optJSONObject("video_list") ?: throw IOException("没有可用清晰度")
+        var videoList = info.optJSONObject("video_list") ?: throw IOException("没有可用清晰度")
+        val offered = videoList.keys().asSequence().mapNotNull(videoList::optJSONObject).toList()
+        if (offered.isNotEmpty() && offered.all {
+                it.str("main_url").isNotBlank() &&
+                    it.str("codec_type").lowercase() in setOf("bytevc2", "bvc2")
+            }) {
+            // 官方播放器有 force_codec 和 codec_type=0 的兼容路径。仅全档 bytevc2 时
+            // 额外读取一次；参数名不保证返回 h264，必须继续按实际模型与视频轨道选档。
+            val compatible = fallback.toHttpUrl().newBuilder()
+                .setQueryParameter("codec_type", "0")
+                .setQueryParameter("force_codec", "h264")
+                .build().toString()
+            info = JSONObject(text(compatible)).optJSONObject("video_info")?.optJSONObject("data")
+                ?: throw IOException("没有播放资源")
+            videoList = info.optJSONObject("video_list") ?: throw IOException("没有可用清晰度")
+        }
         // ByteVC2 resources can expose playable audio but no video track in Android's MP4
         // extractor.
         // Keep missing legacy codec labels usable, but never select a known incompatible variant.
