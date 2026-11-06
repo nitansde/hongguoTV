@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
 env:
-  APP_VERSION: 0.1.20
+  APP_VERSION: 0.1.22
 concurrency:
   group: tv-stable-release
   cancel-in-progress: false
